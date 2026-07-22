@@ -40,6 +40,14 @@ export function buildAgentEnv(): Record<string, string | undefined> {
     if (value !== undefined) env[key] = value;
   }
   env.CLAUDE_AGENT_SDK_CLIENT_APP = "sierge/0.1.0";
+  // Attribute the agent's own git commits to Sierge via env (honest
+  // provenance) without touching the owner's repo config — so the owner's own
+  // manual commits from that repo keep their identity, and adopted repos and
+  // fresh repos behave consistently.
+  env.GIT_AUTHOR_NAME = "Sierge";
+  env.GIT_AUTHOR_EMAIL = "sierge@localhost";
+  env.GIT_COMMITTER_NAME = "Sierge";
+  env.GIT_COMMITTER_EMAIL = "sierge@localhost";
   return env;
 }
 
