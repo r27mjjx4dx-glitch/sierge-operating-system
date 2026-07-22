@@ -282,8 +282,16 @@ async function buildReviewPacket(
   project: ProjectSummary,
   task: Task,
 ): Promise<void> {
-  const files = await changedFiles(project.repoPath, task.branchName);
-  const stat = await diffStat(project.repoPath, task.branchName).catch(() => null);
+  const files = await changedFiles(
+    project.repoPath,
+    task.branchName,
+    project.defaultBranch,
+  );
+  const stat = await diffStat(
+    project.repoPath,
+    task.branchName,
+    project.defaultBranch,
+  ).catch(() => null);
 
   // One cheap resumed query for the plain-language summary while context is hot.
   let summaryMarkdown: string | null = null;
@@ -397,6 +405,7 @@ export async function acceptTask(
       project.repoPath,
       task.branchName,
       `Accept: ${task.title} (Sierge task ${task.id})`,
+      project.defaultBranch,
     );
     task.acceptMergeSha = sha;
     await saveTask(task); // record the merge before cleanup
@@ -501,12 +510,18 @@ export async function reconcileInterruptedAccepts(
 
       const exists = await branchExists(project.repoPath, task.branchName);
       const merged =
-        !exists || (await isMergedIntoMain(project.repoPath, task.branchName));
+        !exists ||
+        (await isMergedIntoMain(
+          project.repoPath,
+          task.branchName,
+          project.defaultBranch,
+        ));
 
       if (merged) {
         // The merge completed before the crash — finish the accept.
         const sha =
-          task.acceptMergeSha ?? (await mainHeadSha(project.repoPath));
+          task.acceptMergeSha ??
+          (await mainHeadSha(project.repoPath, project.defaultBranch));
         await removeTaskWorktree(
           project.repoPath,
           project.id,

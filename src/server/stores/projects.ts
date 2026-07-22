@@ -8,7 +8,12 @@ import {
   readText,
 } from "../fsStore.js";
 import { registryPath, defaultProjectsHome } from "../config.js";
-import { commitSiergeDocs, ensureRepo } from "../gitManager.js";
+import {
+  commitSiergeDocs,
+  ensureRepo,
+  hasStagedChanges,
+  isGitRepo,
+} from "../gitManager.js";
 import type { ContextDoc, ProjectSummary } from "../../shared/types.js";
 
 /**
@@ -37,7 +42,12 @@ const CONTEXT_TEMPLATES: Array<{ slug: string; title: string; body: string }> = 
 
 export async function listProjects(): Promise<ProjectSummary[]> {
   const reg = await readJson<Registry>(registryPath, { projects: [] });
-  return reg.projects;
+  // Backfill fields for projects created before Slice 2 (registry migration).
+  return reg.projects.map((p) => ({
+    ...p,
+    defaultBranch: p.defaultBranch ?? "main",
+    adopted: p.adopted ?? false,
+  }));
 }
 
 export async function getProject(id: string): Promise<ProjectSummary | null> {
@@ -70,15 +80,34 @@ export async function createProject(
     throw new Error("A project already exists at that folder.");
   }
 
+  // Adopting an EXISTING repository is higher-consequence than creating a new
+  // one. Sierge's setup commit stages only `.sierge/`, but `git commit`
+  // commits the whole index — so refuse if the owner has pre-staged work, to
+  // guarantee Sierge never sweeps their changes into its commit. (Untracked or
+  // modified-unstaged files are left untouched.) Sierge also never overwrites
+  // the repository's git identity.
+  const adopted = await isGitRepo(targetPath);
+  if (adopted && (await hasStagedChanges(targetPath))) {
+    throw new Error(
+      "This project has staged (git add-ed) changes waiting to be committed. Commit or unstage them first, then add it to Sierge — Sierge won't include your in-progress work in its setup commit.",
+    );
+  }
+
+  // ensureRepo is minimally invasive on an existing repo (no identity change,
+  // no commits) and returns the repository's default branch.
+  const defaultBranch = await ensureRepo(targetPath);
+
   const project: ProjectSummary = {
     id: crypto.randomUUID().slice(0, 8),
     name: trimmed,
     repoPath: targetPath,
+    defaultBranch,
+    adopted,
     createdAt: new Date().toISOString(),
   };
 
-  // Scaffold repo + context docs, then commit so history starts clean.
-  await ensureRepo(targetPath);
+  // Scaffold context docs and commit ONLY the .sierge directory — never the
+  // owner's files — attributed to Sierge.
   const contextDir = path.join(targetPath, ".sierge", "context");
   await fsp.mkdir(contextDir, { recursive: true });
   for (const t of CONTEXT_TEMPLATES) {
@@ -87,13 +116,7 @@ export async function createProject(
       await writeFileAtomic(file, t.body);
     }
   }
-  const { execa } = await import("execa");
-  await execa("git", ["add", "-A"], { cwd: targetPath, windowsHide: true });
-  await execa(
-    "git",
-    ["commit", "-m", "Add Sierge project context", "--allow-empty"],
-    { cwd: targetPath, windowsHide: true },
-  );
+  await commitSiergeDocs(targetPath, "Add Sierge project context");
 
   await writeJsonAtomic(registryPath, {
     projects: [...existing, project],

@@ -132,7 +132,12 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       );
       // Worktree is created BEFORE planning so plan + implementation share
       // one cwd (ADR-0002 session continuity).
-      const wt = await createTaskWorktree(project.repoPath, project.id, task.id);
+      const wt = await createTaskWorktree(
+        project.repoPath,
+        project.id,
+        task.id,
+        project.defaultBranch,
+      );
       task.branchName = wt.branchName;
       task.worktreePath = wt.worktreePath;
       await saveTask(task);

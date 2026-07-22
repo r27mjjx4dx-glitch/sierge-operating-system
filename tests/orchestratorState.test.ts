@@ -21,8 +21,15 @@ beforeAll(async () => {
 
 async function makeProject(id: string): Promise<ProjectSummary> {
   const repoPath = await fsp.mkdtemp(path.join(os.tmpdir(), `sierge-${id}-`));
-  await git.ensureRepo(repoPath);
-  return { id, name: id, repoPath, createdAt: new Date().toISOString() };
+  const defaultBranch = await git.ensureRepo(repoPath);
+  return {
+    id,
+    name: id,
+    repoPath,
+    defaultBranch,
+    adopted: false,
+    createdAt: new Date().toISOString(),
+  };
 }
 
 async function seedTask(

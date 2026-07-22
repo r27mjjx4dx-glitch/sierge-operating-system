@@ -146,7 +146,10 @@ function NewProjectForm() {
             placeholder="C:\Users\you\my-project"
           />
           <p className="mt-1 text-xs text-slate-500">
-            Leave empty and Sierge will create a folder for you.
+            Point this at a project you already have to open it, or leave it
+            empty and Sierge will create a new folder for you. If you point at
+            an existing project, commit or put aside any staged changes first —
+            Sierge won't touch your in-progress work.
           </p>
         </div>
         <div className="flex items-center gap-3">

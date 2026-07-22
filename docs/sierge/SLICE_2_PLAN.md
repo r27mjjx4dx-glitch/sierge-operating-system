@@ -71,28 +71,48 @@ unchanged until Slice 2 is approved.
    task files per request, and diffs/change-lists are unbounded. → Slice 2
    should index tasks per project and paginate/summarize large change sets.
 
-## Proposed Slice 2 scope (to build after approval)
+## Slice 2 scope and status
+
+Owner decisions (recorded): **target = an existing repo that needs no config to
+run; sequence = Slice 2 first, on the current process runner (ADR-0003
+sandboxing is the plan of record for a later slice).**
 
 Vertical, safe, and small — mirroring the Slice 1 discipline:
 
-1. **Adopt an existing repository.** A new "Open a project I already have"
-   flow: the owner points Sierge at a folder; Sierge inspects it (is it a git
-   repo? what is its default branch? is the working tree clean?), shows a plain
-   summary, and asks for confirmation before writing anything. Refuse a dirty
-   tree with a clear explanation.
-2. **Default-branch awareness.** Detect and thread the real default branch
-   through worktree creation, diffs, and merge — replacing the `main` literal.
-   Preserve the owner's git identity; attribute Sierge commits explicitly.
-3. **Per-project script configuration.** Owner-supplied, non-secret named
-   variables for validation/preview scripts (edited in the UI, stored outside
-   the repo, never in the audit log), so a real dev server can actually start —
-   without reintroducing the owner's whole shell environment.
-4. **Run one real change end to end** on the owner's chosen project as the
-   acceptance test for the slice.
+1. **Adopt an existing repository.** ✅ **Built.** Pointing Sierge at an existing
+   repo folder now detects it as an adoption, records the real default branch,
+   **refuses if the owner has staged (index) changes** (so Sierge can never
+   sweep in-progress work into its setup commit), commits **only** `.sierge/`,
+   and never overwrites the repository's git identity. Untracked and
+   modified-unstaged files are left untouched.
+2. **Default-branch awareness.** ✅ **Built.** The repository's real default
+   branch (`main`/`master`/`develop`/…) is detected at onboarding, stored on the
+   project, and threaded through worktree creation, diffs, and merge — the `main`
+   literal is gone from those paths. Sierge's own commits (setup, checkpoints,
+   merge) are attributed to `Sierge <sierge@localhost>` via per-commit env,
+   never by changing repo config, so the owner's authorship is preserved.
+3. **Per-project script configuration.** **Deferred** (owner chose "no config").
+   Kept in the plan for when a target needs it; the owner-supplied non-secret
+   allowlist design stands.
+4. **Run one real change end to end** on the owner's named project — the
+   remaining acceptance step. Verified end-to-end against a synthetic existing
+   repo on `master`; awaiting the owner's real repository path.
 
 **Explicitly deferred to a later slice / gated on ADR-0003:** OS-level
 sandboxing of scripts (ADR-0003); non-Node toolchains; multiple concurrent
 tasks; deployment/release; multi-user.
+
+### Known Slice 2 follow-ups (not blocking a first real run)
+
+- **Merge-time dirty-tree check.** `mergeTask` still refuses to merge when the
+  default-branch checkout has *any* `git status` output (including benign
+  untracked build artifacts). For a freshly-adopted clean repo this never
+  triggers, but a real project that keeps untracked files in its default
+  checkout could hit a false refusal. Refining this to "refuse only on changes
+  that would conflict with the merge" is a follow-up; it is a v1 safety guard,
+  left unchanged for now.
+- **Registry migration** for pre–Slice-2 projects is handled by backfilling
+  `defaultBranch: "main"` / `adopted: false` on load.
 
 ## Safety controls that stay UNCHANGED
 

@@ -16,6 +16,10 @@ export interface ProjectSummary {
   id: string;
   name: string;
   repoPath: string;
+  /** The repository's default branch (e.g. main, master, develop). */
+  defaultBranch: string;
+  /** True if Sierge adopted an existing repo (vs. created a new one). */
+  adopted: boolean;
   createdAt: string;
 }
 
