@@ -65,6 +65,8 @@ export function narrate(
     case "NotebookEdit":
       return `Updating a notebook`;
     case "Bash":
+    case "PowerShell":
+    case "Shell":
       return describeCommand(typeof rec.command === "string" ? rec.command : "");
     case "WebFetch":
       return "Wants to fetch a web page";

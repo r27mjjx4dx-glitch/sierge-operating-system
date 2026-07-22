@@ -195,6 +195,45 @@ describe("bash ask cases", () => {
   }
 });
 
+describe("PowerShell tool (Windows shell)", () => {
+  const ps = (command: string) => decide("PowerShell", { command }, impl);
+  it("classifies commands like Bash", () => {
+    expect(ps("npm run build").action).toBe("allow");
+    expect(ps("git commit -m msg").action).toBe("allow");
+    expect(ps("Get-ChildItem -Recurse src").action).toBe("allow");
+    expect(ps("Test-Path package.json").action).toBe("allow");
+  });
+  it("hard-denies dangerous commands", () => {
+    expect(ps("Remove-Item -Recurse -Force dist").action).toBe("deny");
+    expect(ps("git push").action).toBe("deny");
+  });
+  it("asks for unclassified commands", () => {
+    expect(ps("Invoke-Expression $x").action).toBe("ask");
+  });
+  it("denies during planning", () => {
+    expect(decide("PowerShell", { command: "npm test" }, plan).action).toBe("deny");
+  });
+});
+
+describe("relative secret references in shell commands", () => {
+  it("denies reads of secret files via harmless-looking commands", () => {
+    expect(bash("cat .env").action).toBe("deny");
+    expect(bash("type .env.local").action).toBe("deny");
+    expect(decide("PowerShell", { command: "Get-Content .env" }, impl).action).toBe(
+      "deny",
+    );
+    expect(bash("cat credentials.json").action).toBe("deny");
+  });
+  it("denies touching .sierge metadata via shell", () => {
+    expect(bash("echo x > .sierge/context/overview.md").action).toBe("deny");
+    expect(bash("cat .sierge/decisions.md").action).toBe("deny");
+  });
+  it("still allows normal file arguments", () => {
+    expect(bash("cat src/app.ts").action).toBe("allow");
+    expect(bash("node scripts/environment-setup.js").action).toBe("allow");
+  });
+});
+
 describe("other tools", () => {
   it("web tools ask", () => {
     expect(decide("WebFetch", { url: "https://x.com" }, impl).action).toBe("ask");

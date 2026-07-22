@@ -133,6 +133,9 @@ const ALLOW_COMMAND_PATTERNS: RegExp[] = [
   /^(ls|dir|cat|type|pwd|cd|mkdir|echo|findstr|grep|head|tail|wc|copy|cp|move|mv|ren)\b.*$/i,
   /^where\s+\S+$/i,
   /^set\s*$/i,
+  // Harmless PowerShell cmdlets (read/inspect only; writes use Write/Edit tools)
+  /^(get-childitem|get-content|get-item|get-location|test-path|select-string|measure-object|write-output|write-host)\b.*$/i,
+  /^new-item\s+.*-itemtype\s+directory\b.*$/i,
 ];
 
 /** Extract absolute-path-looking tokens from a shell command. */
@@ -164,6 +167,21 @@ function classifyBash(command: string, ctx: PolicyContext): Ruling {
         `The command references a path outside the task workspace: ${token}`,
       );
     }
+    if (isSecretPath(token)) {
+      return deny("bash:secret-path", "The command touches a credential/secret file.");
+    }
+    if (isSiergeMetadataPath(token)) {
+      return deny(
+        "bash:sierge-metadata",
+        "Sierge's own context/metadata files are read-only for the agent.",
+      );
+    }
+  }
+
+  // Relative secret/metadata references (e.g. `cat .env`, `Get-Content credentials.json`).
+  for (const raw of cmd.split(/\s+/)) {
+    const token = raw.replace(/^["']+|["']+$/g, "");
+    if (!token || token.startsWith("-")) continue;
     if (isSecretPath(token)) {
       return deny("bash:secret-path", "The command touches a credential/secret file.");
     }
@@ -277,9 +295,14 @@ export function decide(
     return allow("read:in-worktree", "Reading inside the isolated workspace.");
   }
 
-  // --- bash ---------------------------------------------------------------
-  if (tool === "Bash" || tool === "BashOutput" || tool === "KillShell") {
-    if (tool !== "Bash") return allow("bash:aux", "Shell bookkeeping.");
+  // --- shell (Bash on POSIX builds, PowerShell on Windows builds) ---------
+  const SHELL_TOOLS = new Set(["Bash", "PowerShell", "Shell"]);
+  if (
+    SHELL_TOOLS.has(tool) ||
+    tool === "BashOutput" ||
+    tool === "KillShell"
+  ) {
+    if (!SHELL_TOOLS.has(tool)) return allow("bash:aux", "Shell bookkeeping.");
     const rec =
       typeof input === "object" && input !== null
         ? (input as Record<string, unknown>)

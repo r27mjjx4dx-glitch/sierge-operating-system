@@ -184,6 +184,22 @@ export async function removeTaskWorktree(
   }
 }
 
+/**
+ * Commit Sierge's own writes to the in-repo .sierge/ docs immediately, so
+ * the main checkout stays clean (a dirty main blocks merges) and every
+ * owner edit / decision entry is versioned.
+ */
+export async function commitSiergeDocs(
+  repoPath: string,
+  message: string,
+): Promise<void> {
+  await git(repoPath, ["add", ".sierge"]);
+  const staged = await git(repoPath, ["diff", "--cached", "--name-only"]);
+  if (staged.trim()) {
+    await git(repoPath, ["commit", "-m", message]);
+  }
+}
+
 export async function gitVersion(): Promise<string | null> {
   try {
     return (await git(process.cwd(), ["--version"])).trim();

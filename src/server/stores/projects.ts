@@ -8,7 +8,7 @@ import {
   readText,
 } from "../fsStore.js";
 import { registryPath, defaultProjectsHome } from "../config.js";
-import { ensureRepo } from "../gitManager.js";
+import { commitSiergeDocs, ensureRepo } from "../gitManager.js";
 import type { ContextDoc, ProjectSummary } from "../../shared/types.js";
 
 /**
@@ -151,6 +151,7 @@ export async function updateContextDoc(
   if (!SLUG_RE.test(slug)) throw new Error("Invalid context document name.");
   const file = contextFile(project.repoPath, slug);
   await writeFileAtomic(file, body);
+  await commitSiergeDocs(project.repoPath, `Update project notes: ${slug}`);
   return {
     slug,
     title: body.match(/^#\s+(.+)$/m)?.[1] ?? slug,
@@ -167,6 +168,7 @@ export async function appendDecision(
   const current = (await readText(file)) ?? "# Decisions\n";
   const entry = `\n- **${new Date().toISOString().slice(0, 10)}** — ${text}\n`;
   await writeFileAtomic(file, current + entry);
+  await commitSiergeDocs(project.repoPath, "Record decision");
 }
 
 /**
