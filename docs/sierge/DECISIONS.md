@@ -182,3 +182,191 @@ script → an honest "preview unavailable" state.
 - Week-one verification items: same-`cwd` plan→implement resume; Windows
   process-tree kill and worktree cleanup under file locks; SDK
   permission-ordering self-test.
+
+---
+
+## ADR-0003: Post-v1 OS-level sandboxing of Sierge-run scripts on Windows
+
+- **Date:** 2026-07-22
+- **Status:** **Proposed — post-v1; not scheduled into Slice 2.** No v1 code
+  changes. This ADR records the intended durable approach so the residual risk
+  named in `FIRST_VERTICAL_SLICE.md` has a concrete plan.
+
+### Context
+
+The Slice 1 safety model contains the **agent's tool calls** with a
+deny-by-default policy engine (audit-before-decide, hard blocks on
+push/merge/deploy/deletes/credentials/secrets/out-of-worktree/`.sierge`). It
+does **not** contain code that Sierge itself executes on the agent's behalf: the
+project's own `package.json` scripts, run by Sierge during **validation**
+(`test`/`lint`/`typecheck`/`build`) and **preview** (`dev`/`start`). Those
+scripts may be agent-authored (or carry a compromised transitive dependency's
+lifecycle hook), and they run as ordinary Windows processes — outside the SDK
+permission hook. This is the top documented residual risk of v1.
+
+The ADR-0002 review hardening already shrank the blast radius: those scripts run
+with a **curated environment** (`buildScriptEnv()` — no owner-shell secrets, no
+Anthropic auth keys, `extendEnv: false`) inside a **disposable git worktree**
+that never reaches the owner's default branch without an explicit Accept. What
+remains unaddressed is a real OS boundary: a script can still open a socket
+(egress/exfiltration), read files outside the worktree (secrets, the user
+profile), and write outside the worktree (persistence, tampering with the
+owner's other work). This decision selects the mechanism to close that gap.
+
+### Threat model
+
+- **Actor:** code Sierge executes but the agent influenced — an agent-authored
+  `package.json` script, or a malicious/compromised dependency's `postinstall` /
+  build / dev-server hook. Treated as **untrusted**, consistent with the rest of
+  the architecture treating the agent as untrusted.
+- **Trust anchors that remain:** the Sierge host process, the policy engine, the
+  git merge gate, and the owner's approval. The sandbox protects the host and
+  the owner *from the scripts*; it need not protect the scripts from anything.
+- **Assets to protect:**
+  1. **Network** — no outbound connections from a script (blocks exfiltration
+     and remote-payload pull-in). Exception: the owner may explicitly allow a
+     preview server to bind a **local** port for the owner's own browser
+     (loopback in, not egress out).
+  2. **Secrets / out-of-worktree reads** — a script can read only the task
+     worktree, never the user profile, other repos, `.env`/credential stores, or
+     the Sierge data directory.
+  3. **Out-of-worktree writes** — a script can write only inside the task
+     worktree (plus a designated output area), never the owner's other files,
+     autostart locations, or the default branch.
+- **Out of scope:** kernel exploits / VM escape (accepted for a local
+  single-owner tool); protecting one script from another (each runs disposably);
+  the agent's own tool calls (already covered by the policy engine).
+- **Constraint that shapes the choice:** the reference owner runs **Windows 11
+  Home**, so options that require Pro/Enterprise cannot be the default.
+
+### Options considered (verified against current Microsoft / Node / Docker docs)
+
+| Option | Blocks net / secrets / out-of-tree | Runs on Home? | Per-task disposable | Exit code + output back | Owner setup | Verdict |
+|---|---|---|---|---|---|---|
+| **Docker — ephemeral Linux container** (`--network none`, one worktree bind-mount, `--cap-drop ALL --read-only`) | Yes / Yes / Yes | Yes (WSL2 backend) | Yes (`--rm`) | Clean | Docker install; licensing threshold for large orgs | **Recommended primary** |
+| **Disposable WSL2 distro** (`networkingMode=none` or Hyper-V firewall; `automount=false`, `interop=false`; worktree on ext4) | Yes / Yes / Yes | **Yes** | Scripted `wsl --import` / `--unregister` | Clean (`wsl -- cmd`) | WSL install; per-distro orchestration | **Recommended fallback (Home, no Docker)** |
+| **Windows Sandbox** (`.wsb`: `Networking Disable`, read-only mapped worktree, write-only output folder) | Yes / Yes / Yes | **No (Pro+ only)** | Yes (truly disposable) | **No API** — poll a mapped folder | Built-in on Pro | Highest assurance, but **single-instance, Pro-only, no result API** → occasional use only |
+| **Native AppContainer** (capability-gated: no `internetClient` → no net; worktree ACL only) | Yes / Yes / Yes | **Yes** | Via `CreateProcess` | Clean | None (but needs a native helper) | Strong, lowest latency, Home-friendly; **needs a native addon/helper .exe + careful SID/ACL/firewall wiring** → high cost |
+| **Job Objects / restricted tokens alone** | Partial / partial / no | Yes | — | — | — | **Not a security boundary** — resource control / defense-in-depth only |
+| **Node.js Permission Model** (`--permission`) | No (see below) | Yes | — | — | None | **Not viable here** |
+
+Key verified facts driving the ranking:
+
+- **Windows Sandbox is Pro/Enterprise/Education only — it cannot run on Windows
+  11 Home** — runs **one instance at a time** (no per-task parallelism), and has
+  **no headless / exit-code API** (results return only via a writable mapped
+  folder). Disqualified as the default for a Home owner and for throughput,
+  though it is the strongest boundary for an occasional maximum-assurance run on
+  Pro.
+- **The Node permission model is explicitly "not a security boundary."** `npm
+  run` spawns `cmd.exe`, which requires `--allow-child-process`; that grant hands
+  the child unrestricted filesystem and network access (children don't inherit
+  the model), a full escape. Network control (`--allow-net`) exists only on
+  Node ≥ 25. Usable at most as defense-in-depth *inside* a real sandbox.
+- **Docker Desktop** is free for individuals/small orgs but needs a paid
+  subscription above 250 employees **or** $10M revenue; **Docker Engine / Moby
+  is not covered by that license**, so a business can run the same containers
+  fee-free with more setup.
+- **AppContainer** is the only strong *native* boundary that works on Home with
+  no VM and no license, but launching an arbitrary `node`/`cmd` into one needs
+  the Win32 `SECURITY_CAPABILITIES` /
+  `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` sequence — not reachable from
+  pure Node/PowerShell, so it needs a native addon or helper `.exe` plus brittle
+  per-run ACL/firewall wiring (corroborated by OpenAI's public Codex-on-Windows
+  write-up).
+
+### Decision
+
+Introduce a **pluggable "script runner" boundary** with a small interface, and
+route the two existing chokepoints — `validation.ts` and `preview.ts` — through
+it. Ship the backends in this order:
+
+1. **`process` runner (today's behavior)** — the current curated-env `execa`
+   path. Remains the fallback when no sandbox backend is available, and is
+   surfaced to the owner as "checks ran **without** OS isolation."
+2. **`docker` runner (recommended primary)** — ephemeral Linux container per
+   run: `docker run --rm --network none --cap-drop ALL --security-opt
+   no-new-privileges --read-only -v <worktree>:/work:rw -w /work <image> <cmd>`
+   with a `tmpfs` scratch mount. Prefer **Docker Engine** to sidestep Docker
+   Desktop licensing where possible; detect either. For preview, publish only
+   the chosen loopback port (`-p 127.0.0.1:<port>:<port>`) as an explicit,
+   owner-approved, loopback-only allowance — never general egress.
+3. **`wsl` runner (Home fallback, no Docker)** — a Sierge-managed disposable
+   distro created with `wsl --import` and destroyed with `wsl --unregister`,
+   configured `automount=false` + `interop=false`, worktree on ext4, networking
+   `none` for validation (Hyper-V firewall egress rules for the loopback-only
+   preview case).
+4. **`appcontainer` runner (later, optional)** — a native helper `.exe` for
+   owners who want native isolation without Docker/WSL; deferred for its
+   engineering cost and brittleness.
+
+**Windows Sandbox is intentionally not adopted as a runner** (Pro-only,
+single-instance, no result API); it may later be an opt-in "maximum-assurance,
+one-at-a-time" mode for Pro owners.
+
+The active boundary is **selected per install by capability detection**, best
+available first (docker → wsl → process), with an explicit owner override, and
+the active backend is always shown in the UI so "OS-isolated" vs "not isolated"
+is never ambiguous.
+
+### How each asset is protected (target end state)
+
+- **Network:** container `--network none` (or WSL `networkingMode=none`); the
+  only permitted network is an explicit, owner-approved, **loopback-only**
+  preview port — inbound to the owner's browser, not script-initiated egress.
+- **Secrets / out-of-worktree reads:** only the worktree is mounted/visible; no
+  host profile, no other repos, no `.env` outside the worktree, no Sierge data
+  dir. The curated `buildScriptEnv()` allowlist stays, further reduced to the
+  owner's per-project config allowlist (`SLICE_2_PLAN.md` §5) — the sandbox
+  receives exactly that set and nothing else.
+- **Out-of-worktree writes:** only the worktree bind-mount is writable (plus a
+  disposable scratch `tmpfs`); the container/distro is discarded after the run,
+  so nothing persists outside the worktree the owner already reviews.
+
+### Migration plan (post-v1, incremental; v1 stays intact)
+
+1. **Extract the interface (no behavior change).** Define `ScriptRunner`
+   (`runCheck(cmd, cwd, env, timeout) → {exitCode, output}`; `startServer(...) →
+   {url, stop()}`) and make the current `validation.ts` / `preview.ts` logic the
+   `process` implementation behind it. Ship first — a pure refactor, covered by
+   the existing validation/preview tests, changing nothing observable.
+2. **Add the `docker` runner** behind capability detection, defaulting to it when
+   Docker is present, else `process`. Tests: net-blocked (a script that fetches
+   fails), read-blocked (a read outside `/work` fails), write-blocked (a write
+   outside `/work` never appears on the host), result-fidelity (exit
+   codes/output match the process runner).
+3. **Add the `wsl` runner** for Home owners without Docker; same test matrix.
+4. **Surface the active boundary** in the UI and in the review caveats: an
+   un-isolated (`process`) run is labeled, extending the honesty guarantee to
+   "was this checked under OS isolation?"
+5. **(Optional, later) `appcontainer` runner** via a native helper, if native
+   isolation without Docker/WSL proves worth the cost.
+6. **Documentation:** once a sandbox backend is the default, downgrade residual
+   risk #1 in `FIRST_VERTICAL_SLICE.md` from "unsandboxed" to "sandboxed when a
+   backend is present; `process` fallback labeled."
+
+### Consequences
+
+- The policy engine and every other v1 safety control are **unchanged**; the
+  sandbox is an *additional* layer around the two script chokepoints, not a
+  replacement.
+- New owner-facing setup appears only if they opt into a backend (install
+  Docker/WSL); the `process` fallback keeps Sierge working out of the box,
+  honestly labeled as not OS-isolated.
+- Preview gains a real tension — some apps need a little network/config to boot —
+  handled by the loopback-only, owner-approved allowance plus the per-project
+  config allowlist, never general egress.
+- Accepted limitation: none of these defend against kernel/hypervisor escape;
+  acceptable for a local single-owner tool, and a strictly higher bar than the
+  v1 process boundary.
+
+### Sources
+
+Windows Sandbox overview and `.wsb` reference (editions, single-instance,
+networking/mapped-folder config); WSL advanced config (`networkingMode`,
+`firewall`, automount/interop); AppContainer isolation and implementation
+(`SECURITY_CAPABILITIES`); Windows container isolation modes; Node.js Permission
+Model docs and the `--allow-net` (v25) addition; Docker Desktop licensing;
+Chromium sandbox design (Job Objects/integrity not strict boundaries); OpenAI
+"Building a safe, effective sandbox to enable Codex on Windows" (2026). URLs
+captured in the Slice-2 research record.
