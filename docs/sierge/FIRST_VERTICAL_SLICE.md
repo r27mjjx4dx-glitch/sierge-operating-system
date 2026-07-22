@@ -61,5 +61,40 @@
 - Multi-user, auth, remote access; concurrent tasks per project.
 - Cost budgets/caps (estimate display only); SessionStore adapters;
   OS-level sandboxing (worktree + policy is the v1 boundary — known,
-  documented residual risk).
+  documented residual risk; see below).
 - Rich diff viewer (changed-file list + plain descriptions in v1).
+
+## Residual risks (known, documented, accepted for v1)
+
+These are the boundaries of the v1 safety model. They are not defects; they
+are the explicitly-deferred edges, recorded so no one mistakes the policy
+engine for an OS sandbox.
+
+1. **The policy engine governs the agent's tool calls, not arbitrary code
+   execution.** Sierge runs the project's own `package.json` scripts
+   (test / lint / typecheck / build for validation; dev / start for preview)
+   inside the worktree — and those scripts may be agent-authored. That code
+   runs *without* passing through the `PreToolUse` hook / `canUseTool` policy,
+   so a script (or a compromised npm dependency's lifecycle hook) can execute
+   logic the policy would otherwise block (network egress, out-of-worktree
+   writes, `git push`). Two things bound this in v1: the scripts now run with a
+   **curated environment** (`buildScriptEnv`, no owner-shell secrets, no
+   Anthropic auth keys — so a hostile script can't read credentials), and the
+   worktree/branch is disposable and never reaches the owner's `main` without
+   an explicit Accept. **The real fix — OS-level sandboxing of all
+   agent-influenced execution — is the primary post-v1 safety item.** Until
+   then, treat "the agent can run arbitrary code via a project script" as true,
+   and the agent as the (partially trusted) same-Claude actor the architecture
+   assumes.
+2. **Shell-command policy is pattern-based, not a parser.** The classifier
+   hard-blocks pushes/merges/deploys/deletes/credential-and-secret access,
+   out-of-worktree and UNC paths, `.sierge` edits, and now also git
+   global-option forms (`git -C . push`), common obfuscation (empty-quote /
+   caret splitting, encoded PowerShell, `iex`), and quoted/chained redirects.
+   A sufficiently novel obfuscation could still degrade a *hard-block* to an
+   owner **ask** (never to a silent allow) — and `-EncodedCommand`-style
+   opacity is itself hard-blocked because it defeats human review. This is
+   defense-in-depth; OS sandboxing (item 1) is the durable boundary.
+3. **Single-owner, local, loopback only.** Concurrency guards protect against a
+   single owner's duplicate submissions (two tabs, a retry); they are not a
+   multi-user authorization model, which is out of scope for v1.

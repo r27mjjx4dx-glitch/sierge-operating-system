@@ -104,17 +104,23 @@ const HARD_DENY_COMMAND_PATTERNS: Array<{ re: RegExp; reason: string }> = [
   { re: /\b(vercel|netlify|heroku|flyctl|fly|wrangler|amplify)\b/i, reason: "Deploy CLIs are blocked; deployment is out of scope." },
   { re: /\b(aws|az|gcloud|kubectl|terraform|pulumi)\b/i, reason: "Cloud/infra CLIs are blocked." },
   { re: /\bfirebase\s+deploy\b/i, reason: "Deploy CLIs are blocked." },
-  { re: /\brm\s+(-[a-z]*r[a-z]*f?|-[a-z]*f[a-z]*r)[a-z]*\b/i, reason: "Recursive/forced deletion is blocked." },
-  { re: /\brmdir\s+\/s\b/i, reason: "Recursive deletion is blocked." },
-  { re: /\brd\s+\/s\b/i, reason: "Recursive deletion is blocked." },
+  // Recursive/forced deletes — order-insensitive, POSIX + cmd + PowerShell aliases.
+  { re: /\brm\s+(-[a-z]*r[a-z]*f?|-[a-z]*f[a-z]*r|--recursive|--force)/i, reason: "Recursive/forced deletion is blocked." },
+  { re: /\b(rmdir|rd)\b[^|;&\n]*\s\/s\b/i, reason: "Recursive deletion is blocked." },
   { re: /\bdel\s+\/[fsq]\b/i, reason: "Forced deletion is blocked." },
-  { re: /remove-item[^|;&]*-recurse/i, reason: "Recursive deletion is blocked." },
+  // Remove-Item and its aliases (ri, rd, del, erase, rm, rmdir) with -Recurse / -r abbreviations.
+  { re: /\b(remove-item|ri|rd|del|erase|rmdir)\b[^|;&\n]*\s-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?\b/i, reason: "Recursive deletion is blocked." },
+  // Piped enumerate-then-delete: `Get-ChildItem -Recurse | Remove-Item`.
+  { re: /-recurse\b[^\n]*\|[^\n]*\b(remove-item|ri|del|rd|erase|rmdir)\b/i, reason: "Recursive deletion is blocked." },
   { re: /\bformat\s+[a-z]:/i, reason: "Disk operations are blocked." },
   { re: /\bssh(-add|-keygen|-agent)?\b/i, reason: "SSH/credential tooling is off-limits." },
   { re: /\bgh\s+auth\b/i, reason: "Credential tooling is off-limits." },
   { re: /\b(setx|reg)\s/i, reason: "System configuration changes are blocked." },
   { re: /\bschtasks\b/i, reason: "Scheduled-task changes are blocked." },
   { re: /\bshutdown\b/i, reason: "System power commands are blocked." },
+  // Opaque / dynamic execution defeats even human review — block outright.
+  { re: /\bpowershell(\.exe)?\b[^|;&\n]*\s-e(nc(odedcommand)?)?\b/i, reason: "Encoded PowerShell commands are blocked; they can't be reviewed." },
+  { re: /\b(iex|invoke-expression)\b/i, reason: "Dynamic command evaluation (Invoke-Expression) is blocked." },
 ];
 
 const ASK_COMMAND_PATTERNS: Array<{ re: RegExp; reason: string }> = [
@@ -148,55 +154,115 @@ function absolutePathTokens(command: string): string[] {
     tokens.push(
       ...gitBashPaths.map((p) => `${p.charAt(1).toUpperCase()}:${p.slice(2)}`),
     );
+  // UNC network paths (\\server\share, //server/share) — always outside the
+  // worktree, so isInside() will deny them. The `:` in the lookbehind avoids
+  // matching the `//` inside URLs (http://…), which are routed to ASK instead.
+  const uncPaths = command.match(/(?<![A-Za-z0-9:])(?:\\\\|\/\/)[^\s"'<>|;&]+/g);
+  if (uncPaths) tokens.push(...uncPaths);
+  // Drive-relative paths (C:file, no slash) — resolve against the drive's cwd,
+  // not the worktree; treat as out-of-worktree.
+  const driveRel = command.match(/(?<![A-Za-z0-9])[A-Za-z]:(?![\\/])[^\s"'<>|;&]+/g);
+  if (driveRel) tokens.push(...driveRel);
   return tokens;
 }
+
+/**
+ * git accepts global options before the subcommand (`git -C . push`,
+ * `git -c k=v merge`, `git --no-pager reset --hard`). Collapse those so the
+ * deny/allow patterns see the subcommand right after `git`.
+ */
+function canonicalizeGit(command: string): string {
+  return command.replace(
+    /\bgit\s+((?:(?:-C\s+\S+|-c\s+\S+|--exec-path(?:=\S+)?|--git-dir(?:=\S+)?|--work-tree(?:=\S+)?|--namespace(?:=\S+)?|-p|--paginate|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--(?:no-?)?glob-pathspecs|--icase-pathspecs|--no-optional-locks)\s+)+)/gi,
+    "git ",
+  );
+}
+
+/**
+ * Collapse shell obfuscation that reassembles at execution time — empty quote
+ * pairs (`g""it`), caret escapes (`g^it`), stray backticks — so hard-deny
+ * patterns can't be evaded by splitting a keyword. Used only for MATCHING;
+ * the original command is what runs.
+ */
+function deobfuscate(command: string): string {
+  return command
+    .replace(/(["'`])\1/g, "")
+    .replace(/\^/g, "")
+    .replace(/`/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const TRAVERSAL_SEGMENT = /(^|[\\/])\.\.([\\/]|$)/;
 
 function classifyBash(command: string, ctx: PolicyContext): Ruling {
   const cmd = command.trim();
 
-  // 1. Hard denies apply to the whole command string, chained or not.
+  // 1. Hard denies — checked against the raw string AND de-obfuscated /
+  //    git-canonicalized variants so quote/caret splitting and git global
+  //    options can't smuggle a denied command past the regexes.
+  const deob = deobfuscate(cmd);
+  const matchTargets = [
+    cmd,
+    deob,
+    canonicalizeGit(cmd),
+    canonicalizeGit(deob),
+  ];
   for (const { re, reason } of HARD_DENY_COMMAND_PATTERNS) {
-    if (re.test(cmd)) return deny(`bash:${re.source}`, reason);
+    if (matchTargets.some((t) => re.test(t)))
+      return deny(`bash:${re.source}`, reason);
   }
 
-  // Absolute paths referenced by the command must stay inside the worktree.
-  for (const token of absolutePathTokens(cmd)) {
-    if (!isInside(token, ctx.worktreePath)) {
+  // Path containment: every absolute/UNC/drive-relative token, and every
+  // relative token that traverses upward (`..`), must resolve inside the
+  // worktree. Also block secret and .sierge references. Traversal tokens are
+  // skipped for a leading `git` (git can't write outside its repo via an
+  // argument or commit message, and messages legitimately contain `../`).
+  const isGitLead = /^git\b/i.test(cmd);
+  const pathTokens = [
+    ...absolutePathTokens(cmd),
+    ...(isGitLead
+      ? []
+      : cmd
+          .split(/\s+/)
+          .map((raw) => raw.replace(/^["'`]+|["'`]+$/g, ""))
+          .filter((t) => t && !t.startsWith("-") && TRAVERSAL_SEGMENT.test(t))),
+  ];
+  for (const token of pathTokens) {
+    if (isSecretPath(token))
+      return deny("bash:secret-path", "The command touches a credential/secret file.");
+    if (isSiergeMetadataPath(token))
+      return deny(
+        "bash:sierge-metadata",
+        "Sierge's own context/metadata files are read-only for the agent.",
+      );
+    if (!isInside(resolveAgainst(ctx.worktreePath, token), ctx.worktreePath))
       return deny(
         "bash:path-outside-worktree",
         `The command references a path outside the task workspace: ${token}`,
       );
-    }
-    if (isSecretPath(token)) {
-      return deny("bash:secret-path", "The command touches a credential/secret file.");
-    }
-    if (isSiergeMetadataPath(token)) {
-      return deny(
-        "bash:sierge-metadata",
-        "Sierge's own context/metadata files are read-only for the agent.",
-      );
-    }
   }
 
-  // Relative secret/metadata references (e.g. `cat .env`, `Get-Content credentials.json`).
+  // Relative secret/metadata references without traversal (e.g. `cat .env`).
   for (const raw of cmd.split(/\s+/)) {
-    const token = raw.replace(/^["']+|["']+$/g, "");
+    const token = raw.replace(/^["'`]+|["'`]+$/g, "");
     if (!token || token.startsWith("-")) continue;
-    if (isSecretPath(token)) {
+    if (isSecretPath(token))
       return deny("bash:secret-path", "The command touches a credential/secret file.");
-    }
-    if (isSiergeMetadataPath(token)) {
+    if (isSiergeMetadataPath(token))
       return deny(
         "bash:sierge-metadata",
         "Sierge's own context/metadata files are read-only for the agent.",
       );
-    }
   }
 
-  // Redirection into secret or metadata files.
-  const redirect = cmd.match(/>{1,2}\s*([^\s"'|;&]+)/);
-  if (redirect && redirect[1]) {
-    const target = resolveAgainst(ctx.worktreePath, redirect[1]);
+  // Redirection into secret / metadata / out-of-worktree targets — every
+  // redirect in the command, quoted or bare.
+  const redirectRe = /(?:>{1,2})\s*(?:"([^"]+)"|'([^']+)'|([^\s"'|;&]+))/g;
+  for (let m = redirectRe.exec(cmd); m !== null; m = redirectRe.exec(cmd)) {
+    const raw = m[1] ?? m[2] ?? m[3];
+    if (!raw) continue;
+    const target = resolveAgainst(ctx.worktreePath, raw);
     if (isSecretPath(target))
       return deny("bash:redirect-secret", "Writing to a secret file is blocked.");
     if (isSiergeMetadataPath(target))
@@ -213,10 +279,11 @@ function classifyBash(command: string, ctx: PolicyContext): Ruling {
     if (re.test(cmd)) return ask(`bash:${re.source}`, reason);
   }
 
-  // 3. Allow list. For chained commands every segment must be allowed.
+  // 3. Allow list. For chained commands every segment must be allowed;
+  //    git segments are canonicalized so `git -C . status` still allows.
   const segments = cmd
     .split(/&&|\|\||;|\|/)
-    .map((s) => s.trim())
+    .map((s) => canonicalizeGit(s.trim()))
     .filter(Boolean);
   if (
     segments.length > 0 &&

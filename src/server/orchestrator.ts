@@ -10,11 +10,14 @@ import {
   appendDecision,
   composeContextBundle,
 } from "./stores/projects.js";
-import { loadTask, saveTask, transition } from "./stores/tasks.js";
+import { listTasks, loadTask, saveTask, transition } from "./stores/tasks.js";
 import {
+  branchExists,
   changedFiles,
   checkpointWorktree,
   diffStat,
+  isMergedIntoMain,
+  mainHeadSha,
   mergeTask,
   removeTaskWorktree,
 } from "./gitManager.js";
@@ -78,6 +81,9 @@ export async function startPlanning(
   busyProjects.add(project.id); // acquired synchronously — no double-start window
 
   try {
+    // A newly (re)planned task always needs fresh owner approval before it can
+    // implement — clear any stale approval from a prior plan version.
+    task.planApproved = false;
     await transition(task, "planning", null);
     // ADR-0002 gate: no task may run unless the permission-ordering
     // self-test has passed against the installed SDK version.
@@ -142,34 +148,39 @@ export async function approvePlan(
   if (task.status !== "plan_ready") {
     throw new Error("There is no plan awaiting approval on this task.");
   }
+  // Acquire the mutex SYNCHRONOUSLY right after the idle check — no await
+  // between them — so two concurrent approvals can't both pass requireIdle.
   requireIdle(project.id);
+  busyProjects.add(project.id);
 
-  const edited = markdown.trim() !== (task.plan?.markdown ?? "").trim();
-  const version = (task.plan?.version ?? 0) + (edited ? 1 : 0);
-  task.plan = makePlan(markdown, version, edited);
-  if (edited) task.planHistory = [...task.planHistory, task.plan];
-  await saveTask(task);
-
-  await taskEvents.emit(ref(task), {
-    type: "owner_action",
-    taskId: task.id,
-    action: edited ? "plan_edited" : "plan_approved",
-    detail: edited ? "Owner edited the plan before approving." : null,
-  });
-  await appendDecision(
-    project,
-    `Approved plan v${task.plan.version} for "${task.title}": ${task.plan.sections.outcome ?? task.ownerRequest.slice(0, 120)}`,
-  );
-
-  busyProjects.add(project.id); // acquired before the async work is scheduled
+  let handedOff = false;
   try {
+    const edited = markdown.trim() !== (task.plan?.markdown ?? "").trim();
+    const version = (task.plan?.version ?? 0) + (edited ? 1 : 0);
+    task.plan = makePlan(markdown, version, edited);
+    if (edited) task.planHistory = [...task.planHistory, task.plan];
+    task.planApproved = true; // gates the failed -> implementing retry path
+    await saveTask(task);
+
+    await taskEvents.emit(ref(task), {
+      type: "owner_action",
+      taskId: task.id,
+      action: edited ? "plan_edited" : "plan_approved",
+      detail: edited ? "Owner edited the plan before approving." : null,
+    });
+    await appendDecision(
+      project,
+      `Approved plan v${task.plan.version} for "${task.title}": ${task.plan.sections.outcome ?? task.ownerRequest.slice(0, 120)}`,
+    );
+
     await transition(task, "implementing", null);
-  } catch (err) {
-    busyProjects.delete(project.id);
-    throw err;
+    handedOff = true;
+    // Long-running: runs in the background; progress streams over SSE.
+    // runImplementation owns the mutex from here (idempotent add + finally).
+    void runImplementation(project, task, buildImplementPrompt(task.plan));
+  } finally {
+    if (!handedOff) busyProjects.delete(project.id);
   }
-  // Long-running: runs in the background; progress streams over SSE.
-  void runImplementation(project, task, buildImplementPrompt(task.plan));
 }
 
 // ---------------------------------------------------------------------------
@@ -365,28 +376,44 @@ export async function acceptTask(
   if (task.status !== "review") {
     throw new Error("Only a task in review can be accepted.");
   }
-  // Stop the preview BEFORE merge/worktree removal (Windows file locks).
-  await stopPreview(task.id);
-  await checkpointWorktree(
-    task.worktreePath,
-    "Sierge checkpoint before merge",
-  ).catch(() => {});
+  // Same synchronous mutex as the other mutating handlers, so a concurrent
+  // accept/discard/request-changes on this task can't interleave with the
+  // merge + worktree removal.
+  requireIdle(project.id);
+  busyProjects.add(project.id);
+  try {
+    // Persist an accept-intent marker BEFORE touching git so a crash between
+    // the merge and the final transition is reconcilable on restart.
+    task.acceptInProgress = true;
+    await saveTask(task);
 
-  const sha = await mergeTask(
-    project.repoPath,
-    task.branchName,
-    `Accept: ${task.title} (Sierge task ${task.id})`,
-  );
-  await removeTaskWorktree(project.repoPath, project.id, task.id, "delete-merged");
+    await stopPreview(task.id);
+    await checkpointWorktree(
+      task.worktreePath,
+      "Sierge checkpoint before merge",
+    ).catch(() => {});
 
-  await taskEvents.emit(ref(task), {
-    type: "owner_action",
-    taskId: task.id,
-    action: "accepted",
-    detail: `Merged as ${sha.slice(0, 10)}`,
-  });
-  await appendDecision(project, `Accepted "${task.title}" (merge ${sha.slice(0, 10)}).`);
-  await transition(task, "accepted", null);
+    const sha = await mergeTask(
+      project.repoPath,
+      task.branchName,
+      `Accept: ${task.title} (Sierge task ${task.id})`,
+    );
+    task.acceptMergeSha = sha;
+    await saveTask(task); // record the merge before cleanup
+    await removeTaskWorktree(project.repoPath, project.id, task.id, "delete-merged");
+
+    await taskEvents.emit(ref(task), {
+      type: "owner_action",
+      taskId: task.id,
+      action: "accepted",
+      detail: `Merged as ${sha.slice(0, 10)}`,
+    });
+    await appendDecision(project, `Accepted "${task.title}" (merge ${sha.slice(0, 10)}).`);
+    task.acceptInProgress = false;
+    await transition(task, "accepted", null);
+  } finally {
+    busyProjects.delete(project.id);
+  }
 }
 
 export async function discardTask(
@@ -418,29 +445,102 @@ export async function requestChanges(
   task: Task,
   feedback: string,
 ): Promise<void> {
-  if (task.status !== "review" && task.status !== "failed") {
-    throw new Error("Changes can be requested from the review screen (or on a failed task).");
+  // A task may only enter implementation via an owner-approved plan. From
+  // "review" that is guaranteed; from "failed" it is only valid if the plan
+  // was actually approved (a task that failed during PLANNING has none — it
+  // must go back through planning, not straight into implementation).
+  if (task.status === "review") {
+    // ok
+  } else if (task.status === "failed" && task.planApproved) {
+    // ok — resume a post-approval failure
+  } else {
+    throw new Error(
+      "Changes can be requested from the review screen, or on a task whose plan you already approved. Write and approve a plan first.",
+    );
   }
+  // Acquire the mutex synchronously right after the idle check.
   requireIdle(project.id);
-  await stopPreview(task.id);
-  await taskEvents.emit(ref(task), {
-    type: "owner_action",
-    taskId: task.id,
-    action: "changes_requested",
-    detail: feedback,
-  });
   busyProjects.add(project.id);
+
+  let handedOff = false;
   try {
+    await stopPreview(task.id);
+    await taskEvents.emit(ref(task), {
+      type: "owner_action",
+      taskId: task.id,
+      action: "changes_requested",
+      detail: feedback,
+    });
     await transition(task, "implementing", "owner requested changes");
-  } catch (err) {
-    busyProjects.delete(project.id);
-    throw err;
+    handedOff = true;
+    void runImplementation(
+      project,
+      task,
+      `The owner reviewed your work and requests changes. Address the feedback below, then commit.\n\n=== OWNER FEEDBACK ===\n${feedback}\n=== END FEEDBACK ===`,
+    );
+  } finally {
+    if (!handedOff) busyProjects.delete(project.id);
   }
-  void runImplementation(
-    project,
-    task,
-    `The owner reviewed your work and requests changes. Address the feedback below, then commit.\n\n=== OWNER FEEDBACK ===\n${feedback}\n=== END FEEDBACK ===`,
-  );
+}
+
+/**
+ * Startup reconciliation for accepts interrupted by a crash. A task left in
+ * "review" with acceptInProgress set is checked against git: if its branch is
+ * already merged into main (or was deleted after a successful merge), the
+ * accept is completed idempotently; otherwise the merge never happened and the
+ * marker is cleared, leaving the task safely in review. This upholds the
+ * "never silently done, never silently lost" guarantee across a crash.
+ */
+export async function reconcileInterruptedAccepts(
+  projects: ProjectSummary[],
+): Promise<number> {
+  let reconciled = 0;
+  for (const project of projects) {
+    for (const task of await listTasks(project.id)) {
+      if (task.status !== "review" || !task.acceptInProgress) continue;
+
+      const exists = await branchExists(project.repoPath, task.branchName);
+      const merged =
+        !exists || (await isMergedIntoMain(project.repoPath, task.branchName));
+
+      if (merged) {
+        // The merge completed before the crash — finish the accept.
+        const sha =
+          task.acceptMergeSha ?? (await mainHeadSha(project.repoPath));
+        await removeTaskWorktree(
+          project.repoPath,
+          project.id,
+          task.id,
+          "delete-merged",
+        ).catch(() => {});
+        await taskEvents.emit(ref(task), {
+          type: "owner_action",
+          taskId: task.id,
+          action: "accepted",
+          detail: `Merged as ${sha.slice(0, 10)} (completed after restart)`,
+        });
+        await appendDecision(
+          project,
+          `Accepted "${task.title}" (merge ${sha.slice(0, 10)}; completed after a restart).`,
+        );
+        task.acceptInProgress = false;
+        task.acceptMergeSha = sha;
+        await transition(task, "accepted", "accept completed after restart");
+      } else {
+        // The merge never happened — leave the task in review.
+        task.acceptInProgress = false;
+        await saveTask(task);
+        await taskEvents.emit(ref(task), {
+          type: "system_note",
+          taskId: task.id,
+          level: "info",
+          text: "Sierge restarted before this change was accepted. It is safe and unchanged — you can review and accept it again.",
+        });
+      }
+      reconciled += 1;
+    }
+  }
+  return reconciled;
 }
 
 export function isProjectBusy(projectId: string): boolean {

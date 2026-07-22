@@ -3,6 +3,7 @@ import { execa, type ResultPromise } from "execa";
 import getPort from "get-port";
 import treeKill from "tree-kill";
 import { readJson } from "./fsStore.js";
+import { buildScriptEnv } from "./agent/env.js";
 import type { PreviewState } from "../shared/types.js";
 
 /**
@@ -68,13 +69,17 @@ export async function startPreview(
   }
 
   const port = await getPort();
-  const url = `http://127.0.0.1:${port}/`;
+  // Suggest the port via PORT, but do NOT assume the tool honors it — Vite and
+  // others bind their own default. We also scan the child's output for the URL
+  // it actually announces and health-check that.
   const proc = execa(`npm run ${script}`, {
     cwd: worktreePath,
     shell: true,
     windowsHide: true,
     reject: false,
-    env: { ...process.env, PORT: String(port), BROWSER: "none", FORCE_COLOR: "0" },
+    all: true,
+    extendEnv: false,
+    env: { ...buildScriptEnv(), PORT: String(port), BROWSER: "none", FORCE_COLOR: "0" },
   });
   if (proc.pid === undefined) {
     return { status: "failed", url: null, detail: "The preview process could not start." };
@@ -89,6 +94,16 @@ export async function startPreview(
     },
   );
 
+  // Detected URL from the dev server's own output (e.g. Vite "Local: http://…").
+  let announcedUrl: string | null = null;
+  const scan = (chunk: unknown) => {
+    const text = String(chunk);
+    const m = text.match(/https?:\/\/(?:localhost|127\.0\.0\.1):(\d+)\/?/i);
+    if (m) announcedUrl = `http://127.0.0.1:${m[1]}/`;
+  };
+  proc.all?.on("data", scan);
+
+  const suggestedUrl = `http://127.0.0.1:${port}/`;
   const entry: Running = {
     proc,
     pid: proc.pid,
@@ -98,16 +113,21 @@ export async function startPreview(
 
   const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(1500) });
-      // Any HTTP answer means a server is listening — even a 404.
-      void res;
-      entry.state = { status: "ready", url, detail: null };
-      return entry.state;
-    } catch {
-      if (exited) break;
-      await new Promise((r) => setTimeout(r, 750));
+    // Prefer the URL the tool announced; fall back to the suggested port.
+    for (const candidate of announcedUrl
+      ? [announcedUrl, suggestedUrl]
+      : [suggestedUrl]) {
+      try {
+        const res = await fetch(candidate, { signal: AbortSignal.timeout(1500) });
+        void res; // any HTTP answer (even 404) means a server is listening
+        entry.state = { status: "ready", url: candidate, detail: null };
+        return entry.state;
+      } catch {
+        // try the next candidate / poll again
+      }
     }
+    if (exited) break;
+    await new Promise((r) => setTimeout(r, 750));
   }
 
   await stopPreview(taskId);

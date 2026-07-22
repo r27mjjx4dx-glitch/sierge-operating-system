@@ -163,10 +163,12 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const found = await findTask(req.params.taskId);
       if (!found) return reply.status(404).send({ error: "Task not found." });
-      if (!["draft", "plan_ready"].includes(found.task.status)) {
+      // draft: first plan. plan_ready: re-plan. failed: recover from a
+      // planning failure by writing a fresh plan.
+      if (!["draft", "plan_ready", "failed"].includes(found.task.status)) {
         return reply
           .status(409)
-          .send({ error: "Planning can start from a new or re-planned task." });
+          .send({ error: "Planning can start from a new, re-planned, or failed task." });
       }
       // Long-running: kicked off in the background, progress over SSE.
       void startPlanning(found.project, found.task);
@@ -301,25 +303,44 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
       };
 
-      // 1. Current snapshot, 2. full replay, 3. live.
-      send({ type: "task_snapshot", task });
-      for (const event of await taskEvents.replay(ref)) send(event);
-      for (const approval of approvalBroker.listForTask(task.id)) {
-        send({
-          type: "approval_request",
-          id: approval.approvalId,
-          ts: approval.createdAt,
-          taskId: task.id,
-          approvalId: approval.approvalId,
-          kind: approval.kind,
-          title: approval.title,
-          detail: approval.detail,
-          options: approval.options,
-          multiSelect: approval.multiSelect,
-        });
+      // Subscribe BEFORE reading the snapshot/replay so no event emitted during
+      // the file read is lost. Buffer live events until the historical send is
+      // done, then flush them with id-dedup (a persisted event that also
+      // arrives live is skipped; id-less wire events like snapshots pass).
+      const seen = new Set<string>();
+      const buffer: unknown[] = [];
+      let live = false;
+      const onEvent = (event: unknown) => {
+        if (live) {
+          const id = (event as { id?: string }).id;
+          if (id && seen.has(id)) return;
+          if (id) seen.add(id);
+          send(event);
+        } else {
+          buffer.push(event);
+        }
+      };
+      const unsubscribe = taskEvents.subscribe(task.id, onEvent);
+
+      try {
+        // 1. Fresh snapshot (re-loaded so nothing between findTask and now is
+        //    stale), 2. full persisted replay, 3. flush buffered live events.
+        const fresh = (await loadTask(project.id, task.id)) ?? task;
+        send({ type: "task_snapshot", task: fresh });
+        for (const event of await taskEvents.replay(ref)) {
+          if (event.id) seen.add(event.id);
+          send(event);
+        }
+        for (const event of buffer) {
+          const id = (event as { id?: string }).id;
+          if (id && seen.has(id)) continue;
+          if (id) seen.add(id);
+          send(event);
+        }
+      } finally {
+        live = true;
       }
 
-      const unsubscribe = taskEvents.subscribe(task.id, send);
       const heartbeat = setInterval(() => {
         reply.raw.write(": keep-alive\n\n");
       }, 25_000);

@@ -13,7 +13,8 @@ export default defineConfig({
     port: 5180,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:4680",
+        // Keep in sync with the server's SIERGE_PORT (config.ts).
+        target: `http://127.0.0.1:${process.env.SIERGE_PORT ?? 4680}`,
         changeOrigin: false,
       },
     },

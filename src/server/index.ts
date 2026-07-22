@@ -7,6 +7,7 @@ import { registerRoutes } from "./routes.js";
 import { runPreflight } from "./preflight.js";
 import { listProjects } from "./stores/projects.js";
 import { recoverInterruptedTasks } from "./stores/tasks.js";
+import { reconcileInterruptedAccepts } from "./orchestrator.js";
 import { stopAllPreviews } from "./preview.js";
 
 const app = Fastify({ logger: false });
@@ -21,6 +22,14 @@ const recovered = await recoverInterruptedTasks(projects.map((p) => p.id));
 if (recovered > 0) {
   console.log(
     `[sierge] Marked ${recovered} interrupted task(s) as failed after restart (work preserved on their branches).`,
+  );
+}
+// Reconcile accepts interrupted mid-merge: complete the ones that already
+// merged, safely reset the ones that didn't (never silently done or lost).
+const reconciled = await reconcileInterruptedAccepts(projects);
+if (reconciled > 0) {
+  console.log(
+    `[sierge] Reconciled ${reconciled} interrupted accept(s) after restart.`,
   );
 }
 

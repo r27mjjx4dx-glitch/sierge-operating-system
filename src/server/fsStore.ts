@@ -13,6 +13,14 @@ export async function ensureDir(dir: string): Promise<void> {
   await fsp.mkdir(dir, { recursive: true });
 }
 
+const TRANSIENT_RENAME_ERRORS = new Set([
+  "EPERM",
+  "EACCES",
+  "EBUSY",
+  "ENOTEMPTY",
+]);
+const RENAME_RETRY_DELAYS_MS = [15, 40, 90, 180];
+
 export async function writeFileAtomic(
   filePath: string,
   content: string,
@@ -20,7 +28,26 @@ export async function writeFileAtomic(
   await ensureDir(path.dirname(filePath));
   const tmp = `${filePath}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   await fsp.writeFile(tmp, content, "utf8");
-  await fsp.rename(tmp, filePath);
+  // On Windows, rename-over-existing intermittently fails with EPERM/EBUSY
+  // when antivirus or the search indexer holds a transient handle on the
+  // target. Retry with short backoff before giving up, so a lock blip can't
+  // crash a save or a state transition.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fsp.rename(tmp, filePath);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      if (
+        attempt >= RENAME_RETRY_DELAYS_MS.length ||
+        !TRANSIENT_RENAME_ERRORS.has(code)
+      ) {
+        await fsp.rm(tmp, { force: true }).catch(() => {});
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, RENAME_RETRY_DELAYS_MS[attempt]));
+    }
+  }
 }
 
 export async function writeJsonAtomic(

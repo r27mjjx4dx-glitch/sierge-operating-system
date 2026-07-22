@@ -105,3 +105,26 @@ every phase for crash recovery.
   validation report (failing/unavailable checks), and the summary
   (unmet/unverified criteria).
 - Cost figures are labeled estimates (`total_cost_usd` is not billing truth).
+- Sierge-run project scripts (validation, preview) get a **curated env**
+  (`buildScriptEnv`, no owner-shell secrets / no Anthropic auth keys) and run
+  with `extendEnv: false`, so agent-authored scripts cannot read the owner's
+  environment. They still execute unsandboxed code — see `FIRST_VERTICAL_SLICE.md`
+  → Residual risks (OS sandboxing is the post-v1 boundary).
+
+## Recovery & concurrency invariants
+
+- **One agent run per project** — a synchronous mutex (`busyProjects`, acquired
+  with no `await` between the idle check and the acquire) guards every mutating
+  handler: `startPlanning`, `approvePlan`, `requestChanges`, and `acceptTask`.
+- **Approval gate** — a task reaches `implementing` only via an owner-approved
+  plan. `task.planApproved` is set in `approvePlan` and required for the
+  `failed → implementing` retry; a planning failure (no approved plan) can only
+  go `failed → planning` (rewrite a plan), never straight to implementation.
+- **Accept is crash-atomic** — `acceptTask` sets `acceptInProgress` and records
+  `acceptMergeSha` around the merge; `reconcileInterruptedAccepts` (run at boot)
+  completes an already-merged accept or safely resets an un-merged one, so a
+  crash mid-accept is never left "stuck in review" or silently merged-but-hidden.
+  `mergeTask` and `removeTaskWorktree` are idempotent to make retry safe.
+- **Crash-safe persistence** — `writeFileAtomic` retries transient Windows
+  rename locks (EPERM/EBUSY) with backoff; every state transition is persisted
+  before acting; mid-flight tasks are marked `failed` on restart.

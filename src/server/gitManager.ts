@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import fsp from "node:fs/promises";
 import { execa, type Options as ExecaOptions } from "execa";
@@ -134,15 +135,56 @@ export async function diffStat(
   return git(repoPath, ["diff", "--stat", `main...${branchName}`]);
 }
 
+/** True if `ref` exists and is already an ancestor of `main` (i.e. merged). */
+export async function isMergedIntoMain(
+  repoPath: string,
+  ref: string,
+): Promise<boolean> {
+  try {
+    await git(repoPath, ["rev-parse", "--verify", `${ref}^{commit}`]);
+  } catch {
+    // Branch no longer exists — it was deleted after a successful merge.
+    return false;
+  }
+  try {
+    await git(repoPath, ["merge-base", "--is-ancestor", ref, "main"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True if the named branch still exists. */
+export async function branchExists(
+  repoPath: string,
+  branchName: string,
+): Promise<boolean> {
+  try {
+    await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branchName}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Merge an accepted task into main. Owner-approved path only.
- * Fails honestly if the main checkout is dirty or the merge conflicts.
+ * Idempotent: if the branch is already merged (or was deleted after a prior
+ * successful merge), returns main's HEAD instead of failing. Fails honestly
+ * if the main checkout is dirty or the merge conflicts.
  */
 export async function mergeTask(
   repoPath: string,
   branchName: string,
   message: string,
 ): Promise<string> {
+  // Already merged (or branch gone after a prior merge) → nothing to do.
+  if (!(await branchExists(repoPath, branchName))) {
+    return (await git(repoPath, ["rev-parse", "main"])).trim();
+  }
+  if (await isMergedIntoMain(repoPath, branchName)) {
+    return (await git(repoPath, ["rev-parse", "main"])).trim();
+  }
   const status = await git(repoPath, ["status", "--porcelain"]);
   if (status.trim()) {
     throw new Error(
@@ -158,7 +200,7 @@ export async function mergeTask(
       `The merge could not be completed automatically: ${String(err).slice(0, 300)}`,
     );
   }
-  return git(repoPath, ["rev-parse", "HEAD"]);
+  return (await git(repoPath, ["rev-parse", "HEAD"])).trim();
 }
 
 /** Remove a task's worktree and branch (accept keeps history; discard drops it). */
@@ -169,13 +211,20 @@ export async function removeTaskWorktree(
   deleteBranch: "keep" | "delete-merged" | "force-delete",
 ): Promise<void> {
   const wtPath = taskWorktreePath(projectId, taskId);
-  await git(repoPath, ["worktree", "remove", "--force", wtPath]).catch(
-    async () => {
-      // Windows file locks: retry once after a short pause.
-      await new Promise((r) => setTimeout(r, 1500));
-      await git(repoPath, ["worktree", "remove", "--force", wtPath]);
-    },
-  );
+  // Idempotent: only try to remove the worktree if it still exists on disk.
+  if (fs.existsSync(wtPath)) {
+    await git(repoPath, ["worktree", "remove", "--force", wtPath]).catch(
+      async () => {
+        // Windows file locks: retry once after a short pause.
+        await new Promise((r) => setTimeout(r, 1500));
+        await git(repoPath, ["worktree", "remove", "--force", wtPath]).catch(
+          () => {},
+        );
+      },
+    );
+  }
+  // Drop any stale worktree registration left behind by a forced removal.
+  await git(repoPath, ["worktree", "prune"]).catch(() => {});
   const branchName = taskBranchName(taskId);
   if (deleteBranch === "delete-merged") {
     await git(repoPath, ["branch", "-d", branchName]).catch(() => {});
@@ -198,6 +247,10 @@ export async function commitSiergeDocs(
   if (staged.trim()) {
     await git(repoPath, ["commit", "-m", message]);
   }
+}
+
+export async function mainHeadSha(repoPath: string): Promise<string> {
+  return (await git(repoPath, ["rev-parse", "main"])).trim();
 }
 
 export async function gitVersion(): Promise<string | null> {

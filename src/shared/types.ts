@@ -42,6 +42,10 @@ export interface Plan {
   createdAt: string;
 }
 
+// A task carries `planApproved` once the owner has explicitly approved a plan.
+// It gates the failed -> implementing retry path so a task that failed during
+// planning (no approved plan) can never be driven into implementation.
+
 export type ValidationStatus = "passed" | "failed" | "unavailable" | "skipped";
 
 export interface ValidationCheck {
@@ -93,10 +97,16 @@ export interface Task {
   implSessionId: string | null;
   plan: Plan | null;
   planHistory: Plan[];
+  planApproved: boolean;
   validation: ValidationReport | null;
   review: ReviewPacket | null;
   costUsdEstimate: number;
   failureReason: string | null;
+  // Accept crash-atomicity: set before the merge starts, and the resulting
+  // commit recorded after it succeeds, so a crash mid-accept is reconciled on
+  // restart (an already-merged task is completed, not left stuck in "review").
+  acceptInProgress: boolean;
+  acceptMergeSha: string | null;
   createdAt: string;
   updatedAt: string;
 }

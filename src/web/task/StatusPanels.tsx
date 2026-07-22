@@ -74,7 +74,10 @@ export function BuildingPanel({ validating }: { validating: boolean }) {
 export function FailedPanel({ task }: { task: Task }) {
   const [busy, setBusy] = useState<"retry" | "discard" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const canContinue = Boolean(task.implSessionId || task.plan);
+  // Only a task whose plan the owner actually approved may resume
+  // implementation; a planning failure must write a fresh plan (which now
+  // works from a failed task). This matches the server's approval gate.
+  const canContinue = task.planApproved;
 
   const run = async (which: "retry" | "discard", fn: () => Promise<unknown>) => {
     if (busy) return;

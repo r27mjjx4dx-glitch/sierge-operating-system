@@ -21,7 +21,9 @@ const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   review: ["accepted", "discarded", "implementing"],
   accepted: [],
   discarded: [],
-  failed: ["discarded", "implementing"],
+  // failed -> planning: rewrite a plan (e.g. after a planning failure).
+  // failed -> implementing: retry a post-approval failure (gated by planApproved).
+  failed: ["discarded", "implementing", "planning"],
 };
 
 function taskFile(projectId: string, taskId: string): string {
@@ -76,10 +78,13 @@ export function newTask(
     implSessionId: null,
     plan: null,
     planHistory: [],
+    planApproved: false,
     validation: null,
     review: null,
     costUsdEstimate: 0,
     failureReason: null,
+    acceptInProgress: false,
+    acceptMergeSha: null,
     createdAt: now,
     updatedAt: now,
   };

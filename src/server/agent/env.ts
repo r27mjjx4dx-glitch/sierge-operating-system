@@ -42,3 +42,30 @@ export function buildAgentEnv(): Record<string, string | undefined> {
   env.CLAUDE_AGENT_SDK_CLIENT_APP = "sierge/0.1.0";
   return env;
 }
+
+// Auth/config keys the AGENT needs but Sierge-run project scripts (validation,
+// preview) must never see — those scripts may be agent-authored.
+const SCRIPT_EXCLUDE = new Set([
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CONFIG_DIR",
+]);
+
+/**
+ * Environment for scripts SIERGE ITSELF runs inside the worktree — the
+ * project's own package.json test/lint/typecheck/build/dev/start scripts,
+ * which the agent may have authored. Same allowlist as the agent minus the
+ * Claude auth keys, so a hostile or compromised-dependency script cannot read
+ * the owner's shell secrets (ADR-0002 env-isolation invariant). Pair with
+ * execa's `extendEnv: false` so process.env is not merged back in.
+ */
+export function buildScriptEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const key of PASS_THROUGH) {
+    if (SCRIPT_EXCLUDE.has(key)) continue;
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
